@@ -1,0 +1,508 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  DynamoCleanerLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-log-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Effect: Allow
+                Resource: arn:aws:logs:*:*:*
+        - PolicyName: !Sub ${AWS::StackName}-dynamo-deletions-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - "dynamodb:CreateBackup"
+                - "dynamodb:DeleteItem"
+                - "dynamodb:DescribeTable"
+                - "dynamodb:Scan"
+                Effect: Allow
+                Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/*
+
+  DynamoCleanerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-dynamo-cleaner-lambda-function
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DynamoCleanerLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import boto3
+
+          def lambda_handler(event, context):
+                dynamodb = boto3.client('dynamodb')
+                
+                # Get the keys from the event
+                body = json.loads(event['body'])
+                table_names = [s.strip() for s in body['tableNames'].split(',')]
+                attribute_names = [s.strip() for s in body['attributeNames'].split(',')]
+                attribute_types = [s.strip() for s in body['attributeTypes'].split(',')]
+                attribute_values = [s.strip() for s in body['attributeValues'].split(',')]
+                
+                # Create expression attribute values
+                expression_attribute_values = {}
+                for idx, attribute_name in enumerate(attribute_names):
+                  attribute_name = ":" + attribute_name
+                  expression_attribute_values[attribute_name] = {attribute_types[idx]:attribute_values[idx]}
+                
+                # Create filter expression
+                filter_expression = ""
+                for i,key in enumerate(expression_attribute_values):
+                  filter_expression += key[1:]
+                  filter_expression += " = "
+                  filter_expression += key
+                  if i != len(expression_attribute_values) - 1:
+                    filter_expression += ' or '
+                  
+                for table in table_names:
+                  table_name = table.strip()
+                  
+                  # Get key schema
+                  table_response = dynamodb.describe_table(
+                      TableName=table_name,
+                  )
+                  key_schema = table_response['Table']['KeySchema']
+              
+                  # Store a full backup of the table before deletion
+                  backup_name = f"{table_name}-{int(time.time())}"
+                  backup_response = dynamodb.create_backup(
+                      TableName=table_name,
+                      BackupName=backup_name
+                  )
+                  
+                  # Attributes to paginate through scans
+                  has_more_data = True
+                  last_evaluated_key = None
+                    
+                  
+                  # Start scanning
+                  while has_more_data:
+                      if last_evaluated_key:
+                          response = dynamodb.scan(
+                              TableName=table_name,
+                              FilterExpression=filter_expression,
+                              ExpressionAttributeValues=expression_attribute_values,
+                              ExclusiveStartKey=last_evaluated_key
+                          )
+                      else:
+                          response = dynamodb.scan(
+                              TableName=table_name,
+                              FilterExpression=filter_expression,
+                              ExpressionAttributeValues=expression_attribute_values
+                          )
+                      
+                      # Get matching and delete items
+                      items = response.get('Items', [])
+                      for item in items:
+                          item_key = {}
+                          for field in key_schema:
+                              item_key[field['AttributeName']] = item[field['AttributeName']]
+                          dynamodb.delete_item(
+                              TableName=table_name,
+                              Key=item_key
+                          )
+                          
+                      # Update pagination attributes
+                      last_evaluated_key = response.get('LastEvaluatedKey', None)
+                      has_more_data = last_evaluated_key is not None
+                  
+                return {
+                  'statusCode': 200,
+                  'headers': {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Headers': 'Content-Type, x-api-key',
+                  },
+                  'body': json.dumps({'message': "Successfully deleted items and stored in backup."})
+                }
+      Timeout: 300
+
+  DynamoRestorerLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-log-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Effect: Allow
+                Resource: arn:aws:logs:*:*:*
+        - PolicyName: !Sub ${AWS::StackName}-dynamo-restorer-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - "dynamodb:*"
+                Effect: Allow
+                Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/*
+
+  DynamoRestorerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-dynamo-restorer-lambda-function
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DynamoRestorerLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+
+          def lambda_handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              table1 = dynamodb.Table(event['table1'])
+              table2 = dynamodb.Table(event['table2'])
+              key = event['key']
+              
+              def get_all_items(table):
+                  items = []
+                  last_key = None
+                  while True:
+                      if last_key:
+                          response = table.scan(ExclusiveStartKey=last_key)
+                      else:
+                          response = table.scan()
+                      items += response['Items']
+                      last_key = response.get('LastEvaluatedKey', None)
+                      if last_key is None:
+                          break
+                  return items
+              
+              def add_missing_items(table1, table2):
+                  items1 = get_all_items(table1)
+                  items2 = get_all_items(table2)
+                  item_keys1 = set([item[key] for item in items1])
+                  for item in items2:
+                      if item[key] not in item_keys1:
+                          table1.put_item(Item=item)
+              
+              add_missing_items(table1, table2)
+      Timeout: 300
+  
+  DynamoCleanerAPILambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+      Policies:
+        - PolicyName: DynamoCleanerAPILambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - 'lambda:InvokeFunction'
+                Effect: Allow
+                Resource: !GetAtt DynamoCleanerLambdaFunction.Arn
+
+  DynamoCleanerAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${AWS::StackName}-DynamoCleanerAPI
+      EndpointConfiguration:
+        Types:
+        - REGIONAL
+  
+  DynamoCleanerProxyResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref DynamoCleanerAPI
+      ParentId: !GetAtt DynamoCleanerAPI.RootResourceId
+      PathPart: '{proxy+}'
+  
+  DynamoCleanerANYMethodRequestModel:
+    Type: 'AWS::ApiGateway::Model'
+    Properties:
+      RestApiId: !Ref DynamoCleanerAPI
+      ContentType: application/json
+      Name: DynamoCleanerANYMethodRequestModel
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: Dynamo Cleaner ANY Method Request Model
+        type: object
+        properties:
+          tableNames:
+            type: string
+          attributeNames:
+            type: string
+          attributeTypes:
+            type: string
+          attributeValues:
+            type: string
+        required:
+          - tableNames
+          - attributeNames
+          - attributeTypes
+          - attributeValues
+
+  DynamoCleanerANYMethodRequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      Name: !Sub ${AWS::StackName}-DynamoCleanerANYMethodRequestValidator
+      RestApiId: !Ref DynamoCleanerAPI
+      ValidateRequestBody: true
+      ValidateRequestParameters: true
+
+  DynamoCleanerANYMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DynamoCleanerAPI
+      ResourceId: !Ref DynamoCleanerProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      RequestValidatorId: !Ref DynamoCleanerANYMethodRequestValidator
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.header.Content-Type : false
+        method.request.header.x-api-key : true
+      RequestModels:
+        application/json : DynamoCleanerANYMethodRequestModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DynamoCleanerLambdaFunction.Arn}/invocations
+        Credentials: !GetAtt DynamoCleanerAPILambdaExecutionRole.Arn
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: Empty
+
+  DynamoCleanerCORSMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DynamoCleanerAPI
+      ResourceId: !Ref DynamoCleanerProxyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              'method.response.header.Access-Control-Allow-Methods': "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'"
+              'method.response.header.Access-Control-Allow-Origin': "'*'"
+            ResponseTemplates:
+              application/json: Empty
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            'method.response.header.Access-Control-Allow-Headers': false
+            'method.response.header.Access-Control-Allow-Methods': false
+            'method.response.header.Access-Control-Allow-Origin': false
+
+  DynamoCleanerAPIDeployment:
+    DependsOn: DynamoCleanerANYMethod
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref DynamoCleanerAPI
+      StageName: Prod
+
+  DynamoCleanerAPIKey:
+    DependsOn: DynamoCleanerAPIDeployment
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub "${AWS::StackName}-DynamoCleanerApiKey"
+      Enabled: true
+      StageKeys:
+      - RestApiId: !Ref DynamoCleanerAPI
+        StageName: Prod
+
+  DynamoCleanerUsagePlan:
+    DependsOn: DynamoCleanerAPIDeployment
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      ApiStages:
+      - ApiId: !Ref DynamoCleanerAPI
+        Stage: Prod
+      UsagePlanName: !Sub "${AWS::StackName}-DynamoCleanerUsagePlan"
+      Quota:
+        Limit: 5000
+        Period: MONTH
+      Throttle:
+        BurstLimit: 200
+        RateLimit: 100
+  
+  DynamoCleanerUsagePlanKey:
+    Type: 'AWS::ApiGateway::UsagePlanKey'
+    Properties:
+      KeyId: !Ref DynamoCleanerAPIKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref DynamoCleanerUsagePlan
+    
+  DynamoCleanerS3FormBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-${AWS::AccountId}-${AWS::Region}-dynamo-cleaner-form-bucket
+
+  CreateS3FormObjectLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-log-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Effect: Allow
+                Resource: arn:aws:logs:*:*:*
+        - PolicyName: !Sub ${AWS::StackName}-dynamo-cleaner-form-bucket-write-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - s3:PutObject
+                - s3:List*
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:s3:::${DynamoCleanerS3FormBucket}
+                  - !Sub arn:aws:s3:::${DynamoCleanerS3FormBucket}/*
+
+  CreateS3FormObjectLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-create-s3-form-object-lambda-function
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def lambda_handler(event, context):
+            s3 = boto3.client('s3')
+            bucket = event['ResourceProperties']['Bucket']
+            object_key = event['ResourceProperties']['ObjectKey']
+            api_endpoint = event['ResourceProperties']['ApiEndpoint']
+            html = """
+            <!DOCTYPE html>
+              <html>
+              <head>
+                <script>
+                  function validateForm() {{
+                    let apiKey = document.forms["cleanerForm"]["apiKey"].value.trim();
+                    let tableNames = document.forms["cleanerForm"]["tableNames"].value.trim();
+                    let attributeNames = document.forms["cleanerForm"]["attributeNames"].value.trim();
+                    let attributeTypes = document.forms["cleanerForm"]["attributeTypes"].value.trim();
+                    let attributeValues = document.forms["cleanerForm"]["attributeValues"].value.trim();
+
+                    if (apiKey === "" || tableNames === "" || attributeNames === "" || attributeTypes === "" || attributeValues === "") {{
+                      alert("All fields are required");
+                      return false;
+                    }}
+
+                    let attributeNamesArray = attributeNames.split(",");
+                    let attributeValuesArray = attributeValues.split(",");
+
+                    if (attributeNamesArray.length !== attributeValuesArray.length) {{
+                      alert("Number of attribute names and values must be equal");
+                      return false;
+                    }}
+
+                    return true;
+                  }}
+                  function submitForm() {{
+                      if (!validateForm()) {{
+                        return;
+                      }}
+                      var apiKey = document.forms["cleanerForm"]["apiKey"].value;
+                      var tableNames = document.forms["cleanerForm"]["tableNames"].value;
+                      var attributeNames = document.forms["cleanerForm"]["attributeNames"].value;
+                      var attributeTypes = document.forms["cleanerForm"]["attributeTypes"].value;
+                      var attributeValues = document.forms["cleanerForm"]["attributeValues"].value;
+                      var xhr = new XMLHttpRequest();
+                      xhr.open("POST", "{apiEndpoint}", true);
+                      xhr.setRequestHeader("Content-Type", "application/json");
+                      xhr.setRequestHeader("x-api-key", apiKey);
+                      xhr.send(JSON.stringify({{ 'tableNames': tableNames, 'attributeNames': attributeNames, 'attributeTypes': attributeTypes, 'attributeValues': attributeValues }}));
+                      xhr.onload = function() {{
+                        if (xhr.status === 200) {{
+                          alert("Submission successful");
+                        }}
+                      }};
+                    }}
+                </script>
+              </head>
+              <body>
+                <form name="cleanerForm">
+                  <p>API Key:</p>
+                  <textarea name="apiKey" style="width:800px; height:25px;"></textarea><br><br>
+                  <p>Table Names:</p>
+                  <textarea name="tableNames" style="width:800px; height:25px;"></textarea><br><br>
+                  <p>Attribute Names:</p>
+                  <textarea name="attributeNames" style="width:800px; height:25px;"></textarea><br><br>
+                  <p>Attribute Types:</p>
+                  <textarea name="attributeTypes" style="width:800px; height:25px;"></textarea><br><br>
+                  <p>Attribute Values:</p>
+                  <textarea name="attributeValues" style="width:800px; height:25px;"></textarea><br><br>
+                  <input type="button" value="Submit" onclick="submitForm()">
+                </form>
+                <p style="font-size:12px;">Note: Please enter table names, attribute names, and attribute values separated by a comma. Please make sure the attribute names and values are in the correct order (attribute1, attribute2 : value1, value2).</p>
+              </body>
+              </html>
+            """.format(apiEndpoint=api_endpoint)
+            s3.put_object(Bucket=bucket, Key=object_key, Body=html, ContentType='text/html')
+            
+            responseData = {}
+            responseData['Bucket'] = bucket
+            responseData['ObjectKey'] = object_key
+            responseData['ApiEndpoint'] = api_endpoint
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, object_key)
+      Handler: index.lambda_handler
+      Role: !GetAtt CreateS3FormObjectLambdaExecutionRole.Arn
+      Runtime: python3.9
+      
+  FormObjectCustomResource:
+    Type: Custom::FormObjectCustomResource
+    Properties:
+      ServiceToken: !GetAtt CreateS3FormObjectLambdaFunction.Arn
+      Bucket: !Ref DynamoCleanerS3FormBucket
+      ObjectKey: index.html
+      ApiEndpoint: !Sub "https://${DynamoCleanerAPI}.execute-api.${AWS::Region}.amazonaws.com/Prod/{proxy+}"

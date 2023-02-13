@@ -1,0 +1,161 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  DynamoCleanerAPILambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+      Policies:
+        - PolicyName: DynamoCleanerAPILambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - 'lambda:InvokeFunction'
+                Effect: Allow
+                Resource: !GetAtt DynamoCleanerLambdaFunction.Arn
+                
+  DynamoCleanerAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${AWS::StackName}-DynamoCleanerAPI
+      EndpointConfiguration:
+        Types:
+        - REGIONAL
+  
+  DynamoCleanerProxyResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref DynamoCleanerAPI
+      ParentId: !GetAtt DynamoCleanerAPI.RootResourceId
+      PathPart: '{proxy+}'
+  
+  DynamoCleanerANYMethodRequestModel:
+    Type: 'AWS::ApiGateway::Model'
+    Properties:
+      RestApiId: !Ref DynamoCleanerAPI
+      ContentType: application/json
+      Name: DynamoCleanerANYMethodRequestModel
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: Dynamo Cleaner ANY Method Request Model
+        type: object
+        properties:
+          tableNames:
+            type: string
+          attributeNames:
+            type: string
+          attributeTypes:
+            type: string
+          attributeValues:
+            type: string
+        required:
+          - tableNames
+          - attributeNames
+          - attributeTypes
+          - attributeValues
+
+  DynamoCleanerANYMethodRequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      Name: !Sub ${AWS::StackName}-DynamoCleanerANYMethodRequestValidator
+      RestApiId: !Ref DynamoCleanerAPI
+      ValidateRequestBody: true
+      ValidateRequestParameters: true
+
+  DynamoCleanerANYMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DynamoCleanerAPI
+      ResourceId: !Ref DynamoCleanerProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      RequestValidatorId: !Ref DynamoCleanerANYMethodRequestValidator
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.header.Content-Type : false
+        method.request.header.x-api-key : true
+      RequestModels:
+        application/json : DynamoCleanerANYMethodRequestModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DynamoCleanerLambdaFunction.Arn}/invocations
+        Credentials: !GetAtt DynamoCleanerAPILambdaExecutionRole.Arn
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: Empty
+
+  DynamoCleanerCORSMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DynamoCleanerAPI
+      ResourceId: !Ref DynamoCleanerProxyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              'method.response.header.Access-Control-Allow-Methods': "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'"
+              'method.response.header.Access-Control-Allow-Origin': "'*'"
+            ResponseTemplates:
+              application/json: Empty
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            'method.response.header.Access-Control-Allow-Headers': false
+            'method.response.header.Access-Control-Allow-Methods': false
+            'method.response.header.Access-Control-Allow-Origin': false
+
+  DynamoCleanerAPIDeployment:
+    DependsOn: DynamoCleanerANYMethod
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref DynamoCleanerAPI
+      StageName: Prod
+
+  DynamoCleanerAPIKey:
+    DependsOn: DynamoCleanerAPIDeployment
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub "${AWS::StackName}-DynamoCleanerApiKey"
+      Enabled: true
+      StageKeys:
+      - RestApiId: !Ref DynamoCleanerAPI
+        StageName: Prod
+
+  DynamoCleanerUsagePlan:
+    DependsOn: DynamoCleanerAPIDeployment
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      ApiStages:
+      - ApiId: !Ref DynamoCleanerAPI
+        Stage: Prod
+      UsagePlanName: !Sub "${AWS::StackName}-DynamoCleanerUsagePlan"
+      Quota:
+        Limit: 5000
+        Period: MONTH
+      Throttle:
+        BurstLimit: 200
+        RateLimit: 100
+  
+  DynamoCleanerUsagePlanKey:
+    Type: 'AWS::ApiGateway::UsagePlanKey'
+    Properties:
+      KeyId: !Ref DynamoCleanerAPIKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref DynamoCleanerUsagePlan

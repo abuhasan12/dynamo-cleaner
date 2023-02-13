@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <script>
+    function validateForm() {
+      let apiKey = document.forms["cleanerForm"]["apiKey"].value.trim();
+      let tableNames = document.forms["cleanerForm"]["tableNames"].value.trim();
+      let attributeNames = document.forms["cleanerForm"]["attributeNames"].value.trim();
+      let attributeTypes = document.forms["cleanerForm"]["attributeTypes"].value.trim();
+      let attributeValues = document.forms["cleanerForm"]["attributeValues"].value.trim();
+
+      if (apiKey === "" || tableNames === "" || attributeNames === "" || attributeTypes === "" || attributeValues === "") {
+        alert("All fields are required");
+        return false;
+      }
+
+      let attributeNamesArray = attributeNames.split(",");
+      let attributeValuesArray = attributeValues.split(",");
+
+      if (attributeNamesArray.length !== attributeValuesArray.length) {
+        alert("Number of attribute names and values must be equal");
+        return false;
+      }
+
+      return true;
+    }
+    function submitForm() {
+        if (!validateForm()) {
+          return;
+        }
+        var apiKey = document.forms["cleanerForm"]["apiKey"].value;
+        var tableNames = document.forms["cleanerForm"]["tableNames"].value;
+        var attributeNames = document.forms["cleanerForm"]["attributeNames"].value;
+        var attributeTypes = document.forms["cleanerForm"]["attributeTypes"].value;
+        var attributeValues = document.forms["cleanerForm"]["attributeValues"].value;
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", "{apiEndpoint}", true);
+        xhr.setRequestHeader("Content-Type", "application/json");
+        xhr.setRequestHeader("x-api-key", apiKey);
+        xhr.send(JSON.stringify({ 'tableNames': tableNames, 'attributeNames': attributeNames, 'attributeTypes': attributeTypes, 'attributeValues': attributeValues }));
+        xhr.onload = function() {
+          if (xhr.status === 200) {
+              alert("Submission successful");
+          }
+        };
+      }
+  </script>
+</head>
+<body>
+  <form name="cleanerForm">
+    <p>API Key:</p>
+    <textarea name="apiKey" style="width:800px; height:25px;"></textarea><br><br>
+    <p>Table Names:</p>
+    <textarea name="tableNames" style="width:800px; height:25px;"></textarea><br><br>
+    <p>Attribute Names:</p>
+    <textarea name="attributeNames" style="width:800px; height:25px;"></textarea><br><br>
+    <p>Attribute Types:</p>
+    <textarea name="attributeTypes" style="width:800px; height:25px;"></textarea><br><br>
+    <p>Attribute Values:</p>
+    <textarea name="attributeValues" style="width:800px; height:25px;"></textarea><br><br>
+    <input type="button" value="Submit" onclick="submitForm()">
+  </form>
+  <p style="font-size:12px;">Note: Please enter table names, attribute names, and attribute values separated by a comma. Please make sure the attribute names and values are in the correct order (attribute1, attribute2 : value1, value2).</p>
+</body>
+</html>
